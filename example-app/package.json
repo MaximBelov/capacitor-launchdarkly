@@ -1,0 +1,30 @@
+{
+  "name": "capacitor-launchdarkly-example",
+  "version": "1.0.0",
+  "description": "Example app for capacitor-launchdarkly",
+  "type": "module",
+  "keywords": [
+    "capacitor",
+    "mobile"
+  ],
+  "scripts": {
+    "start": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/core": "^8.6.2",
+    "@capacitor/ios": "^8.6.2",
+    "@launchdarkly/js-client-sdk": "^4.14.2",
+    "capacitor-launchdarkly": "file:.."
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.6.2",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.8"
+  },
+  "author": "",
+  "license": "MIT",
+  "private": true
+}

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="UTF-8" />
+    <title>LaunchDarkly example</title>
+    <meta
+      name="viewport"
+      content="viewport-fit=cover, width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <meta name="format-detection" content="telephone=no" />
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 0;
+        padding: calc(env(safe-area-inset-top) + 16px) 16px 16px;
+      }
+      label {
+        display: block;
+        margin: 8px 0 4px;
+      }
+      input,
+      textarea {
+        box-sizing: border-box;
+        font: inherit;
+        width: 100%;
+      }
+      .buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 12px 0;
+      }
+      pre {
+        background: #f2f2f2;
+        overflow-x: auto;
+        padding: 8px;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>LaunchDarkly</h1>
+      <p>
+        With a mobile key in capacitor.config (set at sync time) the client is already running. Otherwise type a mobile key, or in a
+        browser a client-side ID, and press Initialize. Nothing typed here is stored.
+      </p>
+      <label for="key">Mobile key or client-side ID</label>
+      <input id="key" autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <label for="context">Context (JSON)</label>
+      <textarea id="context" rows="3">{ "kind": "user", "key": "anonymous_user", "anonymous": true }</textarea>
+      <label for="flag">Flag key</label>
+      <input id="flag" autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <div class="buttons">
+        <button id="initialize">Initialize</button>
+        <button id="waitForInitialization">Wait for initialization</button>
+        <button id="getState">Get state</button>
+        <button id="identify">Identify</button>
+        <button id="variation">Variation</button>
+        <button id="allFlags">All flags</button>
+        <button id="streamingOn">Streaming on</button>
+        <button id="streamingOff">Streaming off</button>
+        <button id="online">Online</button>
+        <button id="offline">Offline</button>
+        <button id="flush">Flush</button>
+        <button id="close">Close</button>
+        <button id="clearStoredContext">Clear stored context</button>
+      </div>
+      <h2>Result</h2>
+      <pre id="result" role="status"></pre>
+      <h2>Events</h2>
+      <pre id="events" aria-live="polite"></pre>
+    </main>
+
+    <script src="./js/example.js" type="module"></script>
+  </body>
+</html>
