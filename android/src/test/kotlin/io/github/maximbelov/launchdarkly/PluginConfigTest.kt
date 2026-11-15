@@ -55,7 +55,6 @@ class PluginConfigTest {
             StartOptions("mob-test", false, true, true, 2.5, ApplicationMetadata("app", "App", "1.2.3", "1.2")),
             start.options,
         )
-        assertEquals(3, start.options.startWaitWholeSeconds)
         assertEquals("shared", Contexts.parse(start.initialContext).key)
     }
 

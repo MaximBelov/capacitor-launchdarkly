@@ -51,7 +51,8 @@ Put the mobile key in `capacitor.config` and the client starts as the app launch
 Why start natively rather than from JavaScript:
 
 - **The flags are there at launch.** The plugin's `load()` runs while Capacitor creates its bridge, before the web view loads
-  your app, so the first request to LaunchDarkly is on its way (or already answered) when your code first asks.
+  your app: the cached flags are in the SDK's store when your code first asks, and the first request to LaunchDarkly is on its
+  way (see "Offline": nothing waits for it).
 - **No anonymous flip.** Every `identify()` stores the context it switched to, and the next start-up begins with that stored
   context instead of `initialContext`. A signed-in user stays signed in as far as the flags are concerned, from the first frame,
   and the SDK serves that context's cached flags while it fetches fresh ones.
@@ -63,7 +64,8 @@ The web layer then reads what is already there:
 ```typescript
 import { LaunchDarkly } from 'capacitor-launchdarkly';
 
-const { initialized, context, flags } = await LaunchDarkly.getState(); // waits for the start-up if it is still running
+// Never waits for the network: offline or just after launch it answers the flags cached for the context.
+const { initialized, source, context, flags } = await LaunchDarkly.getState();
 
 await LaunchDarkly.addListener('flagChange', ({ key, value, previous }) => {
   console.log(`${key} changed from ${JSON.stringify(previous)} to ${JSON.stringify(value)}`);
@@ -86,6 +88,27 @@ Do not commit a real mobile key to a public repository. A mobile key is not a se
 ships inside every copy of your app), but it is still yours: keep it in your app's own configuration.
 
 Without a `mobileKey` in the config, nothing starts natively, and the app calls `initialize()` with one, as it does on the web.
+
+## Offline
+
+The plugin is built for offline-first apps: a cold start without network is never slowed down by flags.
+
+- **Starting never waits for the network.** The native start-up creates the client with a start wait of zero, off the main
+  thread on Android. Both SDKs load the flags they cached for the context into their store while they create the client, so the
+  cached values are readable at once and LaunchDarkly's answer arrives later as `flagChange` events.
+- **`getState()` resolves at once** with what the SDK has: `source: 'network'` once LaunchDarkly has answered in this process,
+  `'cache'` for the values cached on the device on an earlier run, `'none'` when there is nothing yet. `initialized` means
+  "LaunchDarkly answered in this process"; cached values do not count. It waits only for the client object to exist:
+  milliseconds natively, and on the web at most 100 ms for the browser SDK's asynchronous `localStorage` read.
+- **`initialize()` resolves as soon as the client exists**, with the same state.
+- **`waitForInitialization({ timeoutSeconds })` is the one call that waits on purpose**, and offline it resolves
+  `{ initialized: false, timedOut: true }` when the timeout passes; it never rejects for the network.
+- **`identify()` offline** switches to the flags cached for the new context at once, stores the context, and resolves
+  `{ timedOut: true }`: straight away when the SDK knows it is offline, after `timeoutSeconds` at the latest. It does not
+  reject because the network is down.
+- **`setOnline()`** resolves at once; it does not wait for LaunchDarkly to answer.
+
+`variation()` and `allFlags()` read the same store, so they too answer cached values offline.
 
 ## Starting from JavaScript, and on the web
 
@@ -167,7 +190,7 @@ JavaScript with `initialize()` instead. iOS and Android only.
 | **`streaming`**         | <code>boolean</code>                                            | Streams flag updates when `true`, polls when `false`.                                                                                 | <code>true</code>                                                     | 0.1.0 |
 | **`evaluationReasons`** | <code>boolean</code>                                            | Asks LaunchDarkly for the reason behind each evaluation.                                                                              | <code>false</code>                                                    | 0.1.0 |
 | **`offline`**           | <code>boolean</code>                                            | Starts the client offline, until `setOnline({ online: true })`.                                                                       | <code>false</code>                                                    | 0.1.0 |
-| **`startWaitSeconds`**  | <code>number</code>                                             | How long the start waits for the first set of flags, in seconds.                                                                      | <code>5</code>                                                        | 0.1.0 |
+| **`startWaitSeconds`**  | <code>number</code>                                             | The default timeout of `waitForInitialization()`, in seconds. The native start-up itself never waits for the network.                 | <code>5</code>                                                        | 0.1.0 |
 | **`application`**       | <code><a href="#ldapplicationinfo">LDApplicationInfo</a></code> | Application metadata sent to LaunchDarkly with every request.                                                                         |                                                                       | 0.1.0 |
 
 ### Examples
@@ -248,8 +271,9 @@ export default config;
 initialize(options: InitializeOptions) => Promise<LaunchDarklyState>
 ```
 
-Starts the client from JavaScript and waits for the first set of flags or
-`options.startWaitSeconds` (5 by default), whichever comes first.
+Starts the client from JavaScript and resolves as soon as it exists, with
+the flags it cached for the context on an earlier run. It never waits for
+LaunchDarkly: call `waitForInitialization()` for that.
 
 - **iOS, Android**: takes `mobileKey`. Needed only by an app that does not
   put a `mobileKey` in `capacitor.config`; with one there, the client is
@@ -286,11 +310,15 @@ the running client and starts a new one.
 waitForInitialization(options?: WaitForInitializationOptions | undefined) => Promise<WaitForInitializationResult>
 ```
 
-Answers whether the client has received its first set of flags, waiting
-up to `timeoutSeconds` (5 by default) for that when it has not yet.
+Answers whether LaunchDarkly has answered in this process, waiting up to
+`timeoutSeconds` for that when it has not yet (by default the
+`startWaitSeconds` the client was started with, 5 if none). The only call
+that waits for the network on purpose.
 
-Resolves `{ initialized: false }` straight away when no client was
-started, neither natively nor with `initialize()`.
+Never rejects for the network: offline it resolves
+`{ initialized: false, timedOut: true }` once the timeout has passed. With
+no client at all it resolves `{ initialized: false, timedOut: false }` at
+once.
 
 | Param         | Type                                                                                  |
 | ------------- | ------------------------------------------------------------------------------------- |
@@ -309,14 +337,19 @@ started, neither natively nor with `initialize()`.
 getState() => Promise<LaunchDarklyState>
 ```
 
-The state of the native client: whether it has its flags, the current
-context and the value of every flag, read from the native SDK's own
-store. Meant for bootstrapping the web layer at start without a second
-network round trip.
+The state of the client: whether LaunchDarkly has answered, where the
+flags come from, the current context and the value of every flag, read
+from the SDK's own store. Meant for bootstrapping the web layer at start
+without a second network round trip.
 
-While the native start-up is still running, this waits until it is done:
-until the first set of flags is in, or `startWaitSeconds` has passed.
-With no client at all it answers `initialized: false` and no flags.
+It never waits for the network. Before LaunchDarkly answers (offline, or
+just after launch) it resolves at once with the flags the SDK cached for
+the context on an earlier run, `source: 'cache'`, or no flags and
+`source: 'none'` when nothing was cached; the fresh values then arrive as
+`flagChange` events. It waits only for the client object to exist, which
+is local work: milliseconds on iOS and Android, and on the web at most
+100 ms for the browser SDK to read its `localStorage` cache. With no client
+at all it answers `initialized: false`, `source: 'none'` and no flags.
 
 Reading the flags this way sends no evaluation events.
 
@@ -334,9 +367,16 @@ identify(options: IdentifyOptions) => Promise<IdentifyResult>
 ```
 
 Switches the client to another context and resolves when the flags for
-it are loaded, or when `timeoutSeconds` (5 by default) has passed.
+it have arrived from LaunchDarkly, or when `timeoutSeconds` (5 by
+default) has passed. The SDK switches to the flags it cached for the new
+context at once, before it asks the network.
 
-The context the SDK accepted is stored natively, under a key of the
+It does not reject because the network is down: offline it resolves
+`{ timedOut: true }`, at once on iOS and Android when the SDK knows it is
+offline, and after the timeout at the latest. It rejects only for a
+context without a key or when no client was started.
+
+The context is stored, under a key of the
 plugin's own, and the next native start-up begins with it instead of
 `initialContext`. So an app logs out by identifying its anonymous
 context, which then becomes the stored one; `clearStoredContext()`
@@ -541,11 +581,12 @@ Removes every listener of this plugin.
 
 #### LaunchDarklyState
 
-| Prop              | Type                                            | Description                                                                                                               | Since |
-| ----------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----- |
-| **`initialized`** | <code>boolean</code>                            | Whether the client has received its first set of flags, from the network or, when it was started offline, from its cache. | 0.1.0 |
-| **`context`**     | <code><a href="#ldcontext">LDContext</a></code> | The current context. Absent when no client was started.                                                                   | 0.1.0 |
-| **`flags`**       | <code><a href="#ldflagset">LDFlagSet</a></code> | The value of every flag for the current context.                                                                          | 0.1.0 |
+| Prop              | Type                                            | Description                                                                                                                                                                                                                                             | Since |
+| ----------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| **`initialized`** | <code>boolean</code>                            | Whether LaunchDarkly has answered in this process. Flags read from the cache, from a bootstrap or while the client is offline do not count.                                                                                                             | 0.1.0 |
+| **`source`**      | <code>'none' \| 'network' \| 'cache'</code>     | Where `flags` come from: `network` once LaunchDarkly has answered in this process; `cache` before that, when the SDK has values stored on the device for the context from an earlier run (or, on the web, a bootstrap); `none` when it has nothing yet. | 0.1.2 |
+| **`context`**     | <code><a href="#ldcontext">LDContext</a></code> | The current context. Absent when no client was started.                                                                                                                                                                                                 | 0.1.0 |
+| **`flags`**       | <code><a href="#ldflagset">LDFlagSet</a></code> | The value of every flag for the current context.                                                                                                                                                                                                        | 0.1.0 |
 
 
 #### LDSingleKindContext
@@ -599,7 +640,7 @@ Each kind's object has no `kind` of its own.
 | **`streaming`**         | <code>boolean</code>                                              | Streams flag updates when `true`, polls when `false`.                                                                                                                                                                                                                                                                                                       | <code>true</code>  | 0.1.0 |
 | **`evaluationReasons`** | <code>boolean</code>                                              | Asks LaunchDarkly for the reason behind each evaluation. The SDKs then attach it to their evaluation events.                                                                                                                                                                                                                                                | <code>false</code> | 0.1.0 |
 | **`offline`**           | <code>boolean</code>                                              | Starts the client offline: it answers cached or default values and does not connect until `setOnline({ online: true })`. The web SDK has no offline mode: there `offline: true` starts without a stream, and the first flags are still fetched once.                                                                                                        | <code>false</code> | 0.1.0 |
-| **`startWaitSeconds`**  | <code>number</code>                                               | How long the start waits for the first set of flags, in seconds.                                                                                                                                                                                                                                                                                            | <code>5</code>     | 0.1.0 |
+| **`startWaitSeconds`**  | <code>number</code>                                               | The default timeout of `waitForInitialization()`, in seconds. Starting the client never waits for the network.                                                                                                                                                                                                                                              | <code>5</code>     | 0.1.0 |
 | **`application`**       | <code><a href="#ldapplicationinfo">LDApplicationInfo</a></code>   | Application metadata sent to LaunchDarkly with every request. It describes the app; it is not a context, and adds nothing to the contexts counted for billing.                                                                                                                                                                                              |                    | 0.1.0 |
 | **`bootstrap`**         | <code>'localStorage' \| <a href="#ldflagset">LDFlagSet</a></code> | Web only: flags to start with before LaunchDarkly answers. `'localStorage'` starts from the flags the web SDK cached in `localStorage` for the context on an earlier visit, which the SDK does on its own; a flag object (for example rendered by your server) starts from those values. The native SDKs always start from their own cache and ignore this. |                    | 0.1.0 |
 
@@ -616,9 +657,10 @@ Each kind's object has no `kind` of its own.
 
 #### WaitForInitializationResult
 
-| Prop              | Type                 | Since |
-| ----------------- | -------------------- | ----- |
-| **`initialized`** | <code>boolean</code> | 0.1.0 |
+| Prop              | Type                 | Description                                                                 | Since |
+| ----------------- | -------------------- | --------------------------------------------------------------------------- | ----- |
+| **`initialized`** | <code>boolean</code> | Whether LaunchDarkly has answered in this process.                          | 0.1.0 |
+| **`timedOut`**    | <code>boolean</code> | `true` when the timeout passed without an answer, the usual result offline. | 0.1.2 |
 
 
 #### WaitForInitializationOptions
@@ -630,9 +672,9 @@ Each kind's object has no `kind` of its own.
 
 #### IdentifyResult
 
-| Prop           | Type                 | Description                                                                                                                                   | Since |
-| -------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
-| **`timedOut`** | <code>boolean</code> | `true` when the flags of the new context did not arrive in time. The context is switched all the same, and the flags follow when they arrive. | 0.1.0 |
+| Prop           | Type                 | Description                                                                                                                                                                                                                                               | Since |
+| -------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| **`timedOut`** | <code>boolean</code> | `true` when the flags of the new context did not arrive from LaunchDarkly in time, offline included. The context is switched all the same, the SDK answers the flags it cached for it, and the fresh ones follow as `flagChange` events when they arrive. | 0.1.0 |
 
 
 #### IdentifyOptions
@@ -728,6 +770,13 @@ SDK's own `AnonymousKeyContextModifier`, the step `LDClient.init` and `identify`
 configuration, and checks that `anonymous_user` comes out unchanged, with a control that turns generation on and sees the key
 replaced. On iOS the tests decode contexts with the SDK's decoder and check the key and the `anonymous` attribute of single and
 multi-contexts. On both, the auto-start path is tested to build a configuration with environment attributes off.
+
+Offline behaviour is tested on every layer. On the web, a stand-in SDK whose network never answers checks that `initialize()`
+and `getState()` resolve at once with the cached flags, and that `waitForInitialization()` and `identify()` resolve timed out
+after their timeouts. On Android, the state is built from a stand-in store that has cached flags and no connection, and an
+`identify` future that never completes, completes offline or fails resolves timed out. On iOS the same rules are tested, and
+the real SDK is started against an address nothing listens on: the state is there as soon as `start` returns, and `identify`
+resolves timed out within its timeout, with the context stored.
 
 What the tests do not reach is LaunchDarkly itself: start the example app with a real mobile key to see flags arrive.
 

@@ -29,6 +29,9 @@ export const STORED_CONTEXT_KEY = 'CapacitorLaunchDarkly.context';
 
 const DEFAULT_WAIT_SECONDS = 5;
 
+/** The most `initialize()` and `getState()` wait for the browser SDK to read its localStorage cache. */
+export const CACHE_READ_MS = 100;
+
 export const MISSING_SDK_MESSAGE =
   'The LaunchDarkly web SDK is not installed. To use this plugin on the web, run: npm install @launchdarkly/js-client-sdk';
 
@@ -45,8 +48,10 @@ export class LaunchDarklyWeb extends WebPlugin implements LaunchDarklyPlugin {
   private clientSideId?: string;
   private options: LaunchDarklyOptions = {};
   private context?: LDContext;
-  private initialized = false;
-  private starting?: Promise<void>;
+  /** Whether LaunchDarkly answered since this client was started. */
+  private answered = false;
+  /** Settles once the browser SDK has read its cache (or after CACHE_READ_MS). Never waits for the network. */
+  private cacheRead?: Promise<void>;
   private lastValues: LDFlagSet = {};
 
   constructor(private readonly loadSdk: () => Promise<WebSdk> = importSdk) {
@@ -57,7 +62,7 @@ export class LaunchDarklyWeb extends WebPlugin implements LaunchDarklyPlugin {
     const clientSideId = options?.clientSideId;
     if (!clientSideId) throw new Error('initialize needs a clientSideId on the web.');
     if (this.clientSideId === clientSideId) {
-      await this.starting;
+      await this.cacheRead;
       return this.state();
     }
     requireKeys(options.context);
@@ -77,51 +82,75 @@ export class LaunchDarklyWeb extends WebPlugin implements LaunchDarklyPlugin {
     this.clientSideId = clientSideId;
     this.options = startOptions;
     this.context = context;
-    this.initialized = false;
-    client.on('change', (_context: unknown, keys: string[]) => this.flagsChanged(client, keys));
+    this.answered = false;
+    let firstChange!: () => void;
+    const changed = new Promise<void>((resolve) => (firstChange = resolve));
+    client.on('change', (_context: unknown, keys: string[]) => {
+      firstChange();
+      this.flagsChanged(client, keys);
+    });
 
     const bootstrap = startOptions.bootstrap;
-    this.starting = client
+    // Not awaited: start() settles when LaunchDarkly answers or its timeout passes, and nothing here waits for the network.
+    const started = client
       .start({
         timeout: seconds(startOptions.startWaitSeconds),
         // 'localStorage' is the SDK's own behaviour: it starts from the flags it cached for the context.
         ...(bootstrap && bootstrap !== 'localStorage' ? { bootstrap } : {}),
       })
-      .then((result) => {
-        if (this.client !== client) return;
-        this.initialized = result.status === 'complete';
-        this.lastValues = { ...client.allFlags() };
-      });
-    await this.starting;
+      .then(
+        (result) => {
+          if (this.client === client && result.status === 'complete') this.answered = true;
+        },
+        () => undefined,
+      );
+    // The browser SDK reads its localStorage cache asynchronously (FlagPersistence.loadCached), and announces the flags it
+    // found with a 'change' event. The cache read is local, so this waits for it at most CACHE_READ_MS, never for the network.
+    this.cacheRead = Promise.race([changed, started, delay(CACHE_READ_MS)]).then(() => {
+      if (this.client === client) this.lastValues = { ...client.allFlags() };
+    });
+    await this.cacheRead;
     return this.state();
   }
 
   async waitForInitialization(options?: WaitForInitializationOptions): Promise<WaitForInitializationResult> {
     const client = this.client;
-    if (!client) return { initialized: false };
-    if (!this.initialized) {
-      const result = await client.waitForInitialization({ timeout: seconds(options?.timeoutSeconds) });
-      if (this.client === client && result.status === 'complete') this.initialized = true;
+    if (!client) return { initialized: false, timedOut: false };
+    if (!this.answered) {
+      const timeout = seconds(options?.timeoutSeconds ?? this.options.startWaitSeconds);
+      // The SDK's own wait has a timeout too; the race only makes sure this cannot outlive the one asked for.
+      const result = await Promise.race([
+        client.waitForInitialization({ timeout }).catch(() => ({ status: 'failed' as const })),
+        delay(timeout * 1000).then(() => ({ status: 'timeout' as const })),
+      ]);
+      if (this.client === client && result.status === 'complete') this.answered = true;
     }
-    return { initialized: this.initialized };
+    return { initialized: this.answered, timedOut: !this.answered };
   }
 
   async getState(): Promise<LaunchDarklyState> {
-    await this.starting;
+    await this.cacheRead;
     return this.state();
   }
 
   async identify(options: IdentifyOptions): Promise<IdentifyResult> {
     const client = this.started();
     requireKeys(options?.context);
-    const result = await client.identify(options.context, { timeout: seconds(options.timeoutSeconds) });
-    if (result.status === 'error' || result.status === 'shed') {
-      throw new Error(result.status === 'shed' ? 'identify was replaced by a later identify' : 'identify failed');
-    }
-    // On a timeout the SDK has switched to the context and keeps loading its flags; only the wait is over.
+    // Stored first: the SDK switches to the context (and to its cached flags) whether or not LaunchDarkly answers.
     this.context = options.context;
     writeStoredContext(options.context);
-    return { timedOut: result.status === 'timeout' };
+    const timeout = seconds(options.timeoutSeconds);
+    const result = await Promise.race([
+      client.identify(options.context, { timeout }).catch(() => ({ status: 'error' as const })),
+      delay(timeout * 1000).then(() => ({ status: 'timeout' as const })),
+    ]);
+    if (result.status === 'completed') {
+      if (this.client === client) this.answered = true;
+      return { timedOut: false };
+    }
+    // 'timeout', 'error' (a failed request, the usual offline answer) and 'shed' (a later identify replaced it): the flags
+    // did not arrive, which is not a failure of the call.
+    return { timedOut: true };
   }
 
   async variation(options: VariationOptions): Promise<VariationResult> {
@@ -155,8 +184,8 @@ export class LaunchDarklyWeb extends WebPlugin implements LaunchDarklyPlugin {
     this.client = undefined;
     this.clientSideId = undefined;
     this.context = undefined;
-    this.initialized = false;
-    this.starting = undefined;
+    this.answered = false;
+    this.cacheRead = undefined;
     this.lastValues = {};
     await client?.close();
   }
@@ -185,9 +214,12 @@ export class LaunchDarklyWeb extends WebPlugin implements LaunchDarklyPlugin {
   }
 
   private state(): LaunchDarklyState {
+    const flags = this.client ? { ...this.client.allFlags() } : {};
+    const source = this.answered ? 'network' : Object.keys(flags).length > 0 ? 'cache' : 'none';
     return {
-      initialized: this.initialized,
-      flags: this.client ? { ...this.client.allFlags() } : {},
+      initialized: this.answered,
+      source,
+      flags,
       ...(this.context ? { context: this.context } : {}),
     };
   }
@@ -204,6 +236,10 @@ export class LaunchDarklyWeb extends WebPlugin implements LaunchDarklyPlugin {
       this.notifyListeners('flagChange', hadPrevious ? { key, value, previous } : { key, value });
     }
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function seconds(value: number | undefined): number {

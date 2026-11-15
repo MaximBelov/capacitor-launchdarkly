@@ -1,7 +1,6 @@
 package io.github.maximbelov.launchdarkly
 
 import org.json.JSONObject
-import kotlin.math.ceil
 
 /** Application metadata sent with every request. It describes the app; it is not a context. */
 data class ApplicationMetadata(
@@ -17,12 +16,10 @@ data class StartOptions(
     val streaming: Boolean = true,
     val evaluationReasons: Boolean = false,
     val offline: Boolean = false,
+    /** The default timeout of `waitForInitialization()`. Nothing else waits: the client starts without waiting. */
     val startWaitSeconds: Double = DEFAULT_WAIT_SECONDS,
     val application: ApplicationMetadata? = null,
 ) {
-    /** [startWaitSeconds] in whole seconds for the SDK's `init`, rounded up so that a fraction still waits. */
-    val startWaitWholeSeconds: Int get() = ceil(startWaitSeconds).toInt()
-
     companion object {
         const val DEFAULT_WAIT_SECONDS = 5.0
 

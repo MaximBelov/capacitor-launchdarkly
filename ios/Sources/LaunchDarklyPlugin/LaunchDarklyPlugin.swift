@@ -45,26 +45,29 @@ public class LaunchDarklyPlugin: CAPPlugin, CAPBridgedPlugin, ClientEvents {
         guard let given = readContext(call) else { return }
         let options = StartOptions(mobileKey: mobileKey, options: call.getObject("options"))
         LaunchDarklyClient.onMain { [store, client] in
-            // One client per process: the same key changes nothing and answers the state once the start is done.
-            if client.options?.mobileKey == mobileKey {
-                return client.afterStart { call.resolve(Self.state(client)) }
+            // One client per process: the same key changes nothing and answers the state.
+            if client.options?.mobileKey != mobileKey {
+                // The given context plays the part of initialContext: a context an earlier identify() stored wins over it.
+                let context = StartContext.choose(stored: store.read(), initialContext: given.json)
+                client.start(options, context: context)
             }
-            // The given context plays the part of initialContext: a context an earlier identify() stored wins over it.
-            let context = StartContext.choose(stored: store.read(), initialContext: given.json)
-            client.start(options, context: context) { call.resolve(Self.state(client)) }
+            // The client exists now, with its cached flags; LaunchDarkly's answer is not waited for.
+            call.resolve(client.state.dictionary)
         }
     }
 
     @objc func waitForInitialization(_ call: CAPPluginCall) {
-        let timeout = StartOptions.seconds(call.options["timeoutSeconds"])
+        let requested = call.options["timeoutSeconds"]
         LaunchDarklyClient.onMain { [client] in
-            client.waitForInitialization(timeout: timeout) { call.resolve(["initialized": $0]) }
+            let timeout = StartOptions.seconds(requested, default: client.options?.startWaitSeconds ?? StartOptions.defaultWaitSeconds)
+            client.waitForInitialization(timeout: timeout) { call.resolve(["initialized": $0, "timedOut": !$0]) }
         }
     }
 
+    /// Never waits for the network: the client, when there is one, already holds its cached flags.
     @objc func getState(_ call: CAPPluginCall) {
         LaunchDarklyClient.onMain { [client] in
-            client.afterStart { call.resolve(Self.state(client)) }
+            call.resolve(client.state.dictionary)
         }
     }
 
@@ -98,20 +101,24 @@ public class LaunchDarklyPlugin: CAPPlugin, CAPBridgedPlugin, ClientEvents {
     @objc func setStreaming(_ call: CAPPluginCall) {
         guard let enabled = call.getBool("enabled") else { return call.reject("setStreaming needs enabled.") }
         LaunchDarklyClient.onMain { [client] in
-            client.restart({ options in
-                var next = options
-                next.streaming = enabled
-                return next
-            }, done: { error in
-                if let error { call.reject(error.localizedDescription, nil, error) } else { call.resolve() }
-            })
+            do {
+                try client.restart { options in
+                    var next = options
+                    next.streaming = enabled
+                    return next
+                }
+                call.resolve()
+            } catch {
+                call.reject(error.localizedDescription, nil, error)
+            }
         }
     }
 
     @objc func setOnline(_ call: CAPPluginCall) {
         guard let online = call.getBool("online") else { return call.reject("setOnline needs online.") }
         LaunchDarklyClient.onMain { [client] in
-            client.setOnline(online) { call.resolve() }
+            client.setOnline(online)
+            call.resolve()
         }
     }
 
@@ -156,14 +163,5 @@ public class LaunchDarklyPlugin: CAPPlugin, CAPBridgedPlugin, ClientEvents {
             call.reject(error.localizedDescription, nil, error)
             return nil
         }
-    }
-
-    static func state(_ client: LaunchDarklyClient) -> [String: Any] {
-        var state: [String: Any] = ["initialized": client.isInitialized, "flags": JSValues.flags(client.allFlags)]
-        if let json = client.contextJSON,
-           let context = try? JSONSerialization.jsonObject(with: Data(json.utf8)) {
-            state["context"] = context
-        }
-        return state
     }
 }

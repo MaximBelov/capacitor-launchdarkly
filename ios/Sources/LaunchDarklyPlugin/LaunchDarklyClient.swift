@@ -9,6 +9,11 @@ protocol ClientEvents: AnyObject {
 
 /// The one LaunchDarkly client of the process. It outlives a plugin instance, while the SDK keeps one client per process.
 ///
+/// Offline first: nothing here waits for the network unless the caller asked to (`waitForInitialization`, the timeout of
+/// `identify`). `LDClient.start` creates the client before it returns, and the client's initialiser loads the flags cached for
+/// the context into its store before it goes online, so the state is readable straight after `start`; the network answer
+/// arrives later as `flagChange` events.
+///
 /// Every SDK call and every piece of state here is on the main queue: the SDK delivers its completions and observer callbacks
 /// there, so keeping to it leaves nothing to race. Capacitor calls plugin methods on a queue of its own, and the plugin hops to
 /// main with `LaunchDarklyClient.onMain`.
@@ -17,10 +22,17 @@ final class LaunchDarklyClient {
 
     weak var events: ClientEvents?
 
+    /// Applied to every configuration the client is started with. Tests use it to point the SDK at an address that does not
+    /// answer, which is how a phone without network looks to it.
+    var configure: ((inout LDConfig) -> Void)?
+
     private(set) var options: StartOptions?
     private(set) var contextJSON: String?
-    private var starting = false
-    private var afterStartQueue: [() -> Void] = []
+    /// Whether LaunchDarkly answered since this client was started, as seen by the plugin (see `noteAnswer`).
+    private var answered = false
+    /// Set once the client is taken offline. The SDK then counts itself initialised (`go(online: false)` sets its
+    /// `initialized`), which says nothing about an answer, so from then on only an observed answer counts.
+    private var wentOffline = false
     /// The owner of the SDK observers; replaced on every start so a closed client's observers are dropped with it.
     private var observerOwner = NSObject()
 
@@ -32,33 +44,27 @@ final class LaunchDarklyClient {
 
     private var client: LDClient? { options == nil ? nil : LDClient.get() }
 
-    /// Starts the client unless one with the same mobile key is running or starting; one with another key is closed first.
-    /// `done` runs once the start has finished: the first flags are in or the wait is over.
-    func start(_ options: StartOptions, context: ContextChoice, done: (() -> Void)? = nil) {
+    /// Starts the client unless one with the same mobile key is running; one with another key is closed first. Returns once
+    /// the client exists, which is local work; it does not wait for LaunchDarkly.
+    func start(_ options: StartOptions, context: ContextChoice) {
         dispatchPrecondition(condition: .onQueue(.main))
-        if self.options?.mobileKey == options.mobileKey {
-            afterStart { done?() }
-            return
-        }
-        startNow(options, context: context, done: done)
+        if self.options?.mobileKey == options.mobileKey { return }
+        startNow(options, context: context)
     }
 
-    private func startNow(_ options: StartOptions, context: ContextChoice, done: (() -> Void)?) {
+    private func startNow(_ options: StartOptions, context: ContextChoice) {
         if self.options != nil { closeNow() }
         self.options = options
         contextJSON = context.json
-        starting = true
-        if let done { afterStartQueue.append(done) }
+        answered = false
+        wentOffline = options.offline
         let owner = NSObject()
         observerOwner = owner
-        LDClient.start(config: ConfigFactory.make(options), context: context.context, startWaitSeconds: options.startWaitSeconds) { [weak self] _ in
-            guard let self, self.observerOwner === owner else { return }
-            self.starting = false
-            let waiting = self.afterStartQueue
-            self.afterStartQueue = []
-            waiting.forEach { $0() }
-        }
-        // start() creates the client before it returns, so the observers are in place before the first flags can arrive.
+        var config = ConfigFactory.make(options)
+        configure?(&config)
+        // A start wait of zero and no completion: start() creates the client synchronously (TimeoutExecutor runs the
+        // operation in place), so the client and its cached flags are there when it returns. Nothing waits for the network.
+        LDClient.start(config: config, context: context.context, startWaitSeconds: 0)
         observe(owner: owner)
     }
 
@@ -69,77 +75,85 @@ final class LaunchDarklyClient {
                 self?.events?.flagChanged(key: key, value: change.newValue, previous: change.oldValue == .null ? nil : change.oldValue)
             }
         }
+        // Called only when a poll or the stream answered with the flags unchanged: an answer.
+        client.observeFlagsUnchanged(owner: owner) { [weak self] in
+            self?.answered = true
+        }
         client.observeCurrentConnectionMode(owner: owner) { [weak self] mode in
             self?.events?.connectionModeChanged(mode.rawValue)
         }
     }
 
-    /// Restarts the running client with `change` applied to its options, keeping the current context.
-    func restart(_ change: (StartOptions) -> StartOptions, done: @escaping (Error?) -> Void) {
+    /// Recreates the running client with `change` applied to its options, keeping the current context.
+    func restart(_ change: (StartOptions) -> StartOptions) throws {
         dispatchPrecondition(condition: .onQueue(.main))
-        guard let options, let contextJSON else { return done(PluginError.notStarted) }
-        do {
-            let context = ContextChoice(context: try Contexts.parse(contextJSON), json: contextJSON)
-            startNow(change(options), context: context) { done(nil) }
-        } catch {
-            done(error)
+        guard let options, let contextJSON else { throw PluginError.notStarted }
+        let context = ContextChoice(context: try Contexts.parse(contextJSON), json: contextJSON)
+        startNow(change(options), context: context)
+    }
+
+    /// Whether LaunchDarkly answered in this process: observed by the plugin, or reported by the SDK while it has been
+    /// online the whole time (its `isInitialized` turns true on the first answer, and on going offline).
+    private var hasAnswered: Bool {
+        guard let client else { return false }
+        if !answered && !wentOffline && client.isOnline && client.isInitialized {
+            answered = true
         }
+        return answered
     }
 
-    /// Runs `work` once the start has finished, or straight away when nothing is starting.
-    func afterStart(_ work: @escaping () -> Void) {
-        dispatchPrecondition(condition: .onQueue(.main))
-        if starting { afterStartQueue.append(work) } else { work() }
+    /// The state now, from the SDK's store. Never waits.
+    var state: ClientState {
+        StateReader.read(client, answered: hasAnswered, contextJSON: contextJSON)
     }
 
-    /// Switches the context; `done` gets whether the wait for its flags timed out, or the error.
+    /// Switches the context; `done` gets whether its flags did not arrive from LaunchDarkly within `timeout` (offline
+    /// included). The SDK loads the new context's cached flags into its store as it switches (`useCache: .yes`), before it asks
+    /// the network. Never fails for the network.
     func identify(_ context: ContextChoice, timeout: TimeInterval, store: ContextStore, done: @escaping (Result<Bool, Error>) -> Void) {
         dispatchPrecondition(condition: .onQueue(.main))
-        afterStart { [weak self] in
-            guard let self, let client = self.client else { return done(.failure(PluginError.notStarted)) }
-            client.identify(context: context.context, timeout: timeout) { result in
-                Self.onMain {
-                    switch result {
-                    case .complete, .timeout:
-                        // On a timeout the SDK has switched to the context and keeps loading its flags; only the wait is over.
-                        self.contextJSON = context.json
-                        store.write(context.json)
-                        done(.success(result == .timeout))
-                    case .shed:
-                        done(.failure(NSError(domain: "LaunchDarkly", code: 1, userInfo: [NSLocalizedDescriptionKey: "identify was replaced by a later identify"])))
-                    case .error:
-                        done(.failure(NSError(domain: "LaunchDarkly", code: 2, userInfo: [NSLocalizedDescriptionKey: "identify failed"])))
-                    }
-                }
+        guard let client else { return done(.failure(PluginError.notStarted)) }
+        contextJSON = context.json
+        store.write(context.json)
+        client.identify(context: context.context, timeout: timeout) { [weak self] result in
+            Self.onMain {
+                let online = self?.client?.isOnline == true
+                if result == .complete && online { self?.answered = true }
+                done(.success(IdentifyOutcome.timedOut(result, isOnline: online)))
             }
         }
     }
 
-    /// Answers whether the client has its first flags, waiting up to `timeout` for them.
+    /// Answers whether LaunchDarkly answered in this process, waiting up to `timeout` for it.
     func waitForInitialization(timeout: TimeInterval, answer: @escaping (Bool) -> Void) {
         dispatchPrecondition(condition: .onQueue(.main))
         guard options != nil else { return answer(false) }
         let deadline = Date().addingTimeInterval(timeout)
         func check() {
-            if client?.isInitialized == true { return answer(true) }
+            if hasAnswered { return answer(true) }
             if options == nil || Date() >= deadline { return answer(false) }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: check)
         }
         check()
     }
 
-    var isInitialized: Bool { client?.isInitialized == true }
-
     /// Every flag from the SDK's store; reading them this way records no evaluation event.
-    var allFlags: [String: LDValue] { client?.allFlags ?? [:] }
+    var allFlags: [String: LDValue] { client?.storedFlags ?? [:] }
 
     func variation(_ key: String, defaultValue: LDValue) -> LDValue {
         client?.jsonVariation(forKey: key, defaultValue: defaultValue) ?? defaultValue
     }
 
-    func setOnline(_ online: Bool, done: @escaping () -> Void) {
-        guard let client else { return done() }
-        client.setOnline(online) { done() }
+    /// Takes the client online or offline and returns at once: the SDK's completion for going online waits for LaunchDarkly
+    /// to answer, which offline never happens, so it only records the answer when it comes.
+    func setOnline(_ online: Bool) {
+        guard let client else { return }
+        if !online { wentOffline = true }
+        let owner = observerOwner
+        client.setOnline(online) { [weak self] in
+            guard let self, online, self.observerOwner === owner else { return }
+            self.answered = true
+        }
     }
 
     func flush() {
@@ -149,10 +163,6 @@ final class LaunchDarklyClient {
     func close() {
         dispatchPrecondition(condition: .onQueue(.main))
         closeNow()
-        let waiting = afterStartQueue
-        afterStartQueue = []
-        starting = false
-        waiting.forEach { $0() }
     }
 
     private func closeNow() {
@@ -161,5 +171,7 @@ final class LaunchDarklyClient {
         observerOwner = NSObject()
         options = nil
         contextJSON = nil
+        answered = false
+        wentOffline = false
     }
 }

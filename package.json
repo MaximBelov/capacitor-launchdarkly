@@ -1,6 +1,6 @@
 {
   "name": "capacitor-launchdarkly",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "LaunchDarkly feature flags for Capacitor apps through the native iOS and Android client SDKs, started natively at app launch",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",

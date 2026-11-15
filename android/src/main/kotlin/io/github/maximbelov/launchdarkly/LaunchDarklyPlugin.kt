@@ -38,8 +38,8 @@ class LaunchDarklyPlugin : Plugin(), ClientEvents {
         val mobileKey = call.getString("mobileKey")?.takeIf { it.isNotBlank() }
             ?: return call.reject("initialize needs a mobileKey on Android.")
         if (LaunchDarklyClient.mobileKey == mobileKey) {
-            // One client per process: the same key changes nothing and answers the state once the start is done.
-            return LaunchDarklyClient.afterStart { call.resolve(state()) }
+            // One client per process: the same key changes nothing and answers the state.
+            return LaunchDarklyClient.afterCreated { call.resolve(state()) }
         }
         val given = readContext(call) ?: return
         val options = StartOptions.parse(mobileKey, call.getObject("options"))
@@ -50,15 +50,17 @@ class LaunchDarklyPlugin : Plugin(), ClientEvents {
 
     @PluginMethod
     fun waitForInitialization(call: PluginCall) {
-        val timeout = StartOptions.seconds(call.getDouble("timeoutSeconds") ?: StartOptions.DEFAULT_WAIT_SECONDS)
+        val default = LaunchDarklyClient.startOptions?.startWaitSeconds ?: StartOptions.DEFAULT_WAIT_SECONDS
+        val timeout = StartOptions.seconds(call.getDouble("timeoutSeconds") ?: default)
         LaunchDarklyClient.waitForInitialization(timeout) { initialized ->
-            call.resolve(JSObject().put("initialized", initialized))
+            call.resolve(JSObject().put("initialized", initialized).put("timedOut", !initialized))
         }
     }
 
+    /** Never waits for the network: only for the client to exist, which is local work of milliseconds. */
     @PluginMethod
     fun getState(call: PluginCall) {
-        LaunchDarklyClient.afterStart { call.resolve(state()) }
+        LaunchDarklyClient.afterCreated { call.resolve(state()) }
     }
 
     @PluginMethod
@@ -138,11 +140,17 @@ class LaunchDarklyPlugin : Plugin(), ClientEvents {
         }
     }
 
-    private fun state(): JSObject {
-        val state = JSObject()
-            .put("initialized", LaunchDarklyClient.isInitialized)
-            .put("flags", JsValues.flags(LaunchDarklyClient.allFlags()))
-        LaunchDarklyClient.context?.let { state.put("context", JSONObject(it)) }
-        return state
+    private fun state(): JSObject = toJs(LaunchDarklyClient.state())
+
+    companion object {
+        /** A [ClientState] as the object `getState()` resolves with. */
+        fun toJs(state: ClientState): JSObject {
+            val js = JSObject()
+                .put("initialized", state.initialized)
+                .put("source", state.source.js)
+                .put("flags", JsValues.flags(state.flags))
+            state.context?.let { js.put("context", JSONObject(it)) }
+            return js
+        }
     }
 }

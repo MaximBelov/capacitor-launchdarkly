@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { LaunchDarkly } from '../../src';
 import type { LDContext } from '../../src';
-import { LaunchDarklyWeb, MISSING_SDK_MESSAGE, STORED_CONTEXT_KEY, requireKeys } from '../../src/web';
+import { CACHE_READ_MS, LaunchDarklyWeb, MISSING_SDK_MESSAGE, STORED_CONTEXT_KEY, requireKeys } from '../../src/web';
 import type { WebSdk } from '../../src/web';
 
 // A stand-in for @launchdarkly/js-client-sdk: records what the plugin asks of it and lets a test fire 'change'.
@@ -45,7 +45,7 @@ beforeEach(() => storage.clear());
 describe('on the web', () => {
   it('is what the registered plugin uses when there is no native bridge', async () => {
     await expect(LaunchDarkly.initialize({ context: anonymous })).rejects.toThrow('clientSideId');
-    await expect(LaunchDarkly.getState()).resolves.toEqual({ initialized: false, flags: {} });
+    await expect(LaunchDarkly.getState()).resolves.toEqual({ initialized: false, source: 'none', flags: {} });
   });
 
   it('creates one client per page: the same client-side ID again does not create another', async () => {
@@ -55,7 +55,7 @@ describe('on the web', () => {
     const second = await plugin.initialize({ clientSideId: 'cs-1', context: ann });
     expect(createClient).toHaveBeenCalledTimes(1);
     expect(client.start).toHaveBeenCalledTimes(1);
-    expect(first).toEqual({ initialized: true, flags: { on: true }, context: anonymous });
+    expect(first).toEqual({ initialized: true, source: 'network', flags: { on: true }, context: anonymous });
     expect(second).toEqual(first);
   });
 
@@ -150,13 +150,13 @@ describe('on the web', () => {
     expect(storage.has(STORED_CONTEXT_KEY)).toBe(true);
   });
 
-  it('rejects a failed identify and keeps the stored context as it was', async () => {
+  it('resolves a failed identify as timed out instead of rejecting, and stores the context', async () => {
     const { sdk, client } = fakeSdk();
     client.identify.mockResolvedValueOnce({ status: 'error' });
     const plugin = new LaunchDarklyWeb(async () => sdk);
     await plugin.initialize({ clientSideId: 'cs-1', context: anonymous });
-    await expect(plugin.identify({ context: ann })).rejects.toThrow('identify failed');
-    expect(storage.has(STORED_CONTEXT_KEY)).toBe(false);
+    await expect(plugin.identify({ context: ann })).resolves.toEqual({ timedOut: true });
+    expect(JSON.parse(storage.get(STORED_CONTEXT_KEY)!)).toEqual(ann);
   });
 
   it('forgets the stored context on clearStoredContext()', async () => {
@@ -205,8 +205,8 @@ describe('on the web', () => {
 
   it('answers initialized false and no flags before any start', async () => {
     const plugin = new LaunchDarklyWeb(async () => fakeSdk().sdk);
-    await expect(plugin.getState()).resolves.toEqual({ initialized: false, flags: {} });
-    await expect(plugin.waitForInitialization()).resolves.toEqual({ initialized: false });
+    await expect(plugin.getState()).resolves.toEqual({ initialized: false, source: 'none', flags: {} });
+    await expect(plugin.waitForInitialization()).resolves.toEqual({ initialized: false, timedOut: false });
   });
 
   it('reports a start that timed out as not initialized, then waits for the flags on request', async () => {
@@ -215,7 +215,11 @@ describe('on the web', () => {
     const plugin = new LaunchDarklyWeb(async () => sdk);
     const state = await plugin.initialize({ clientSideId: 'cs-1', context: anonymous });
     expect(state.initialized).toBe(false);
-    await expect(plugin.waitForInitialization({ timeoutSeconds: 1 })).resolves.toEqual({ initialized: true });
+    expect(state.source).toBe('cache');
+    await expect(plugin.waitForInitialization({ timeoutSeconds: 1 })).resolves.toEqual({
+      initialized: true,
+      timedOut: false,
+    });
     expect(client.waitForInitialization).toHaveBeenCalledWith({ timeout: 1 });
   });
 
@@ -232,7 +236,7 @@ describe('on the web', () => {
     expect(client.flush).toHaveBeenCalled();
     await plugin.close();
     expect(client.close).toHaveBeenCalled();
-    await expect(plugin.getState()).resolves.toEqual({ initialized: false, flags: {} });
+    await expect(plugin.getState()).resolves.toEqual({ initialized: false, source: 'none', flags: {} });
   });
 
   it('tells the app to install the web SDK when it cannot be imported', async () => {
@@ -262,5 +266,71 @@ describe('on the web', () => {
     } finally {
       (globalThis as Record<string, unknown>).localStorage = saved;
     }
+  });
+});
+
+describe('on the web, offline', () => {
+  // An SDK whose network never answers: start, waitForInitialization and identify never settle. What it has is the cache.
+  function offlineSdk(cached: Record<string, unknown>, announceCache = true) {
+    const fake = fakeSdk(cached);
+    const never = () => new Promise<never>(() => undefined);
+    fake.client.start.mockImplementation(never);
+    fake.client.waitForInitialization.mockImplementation(never);
+    fake.client.identify.mockImplementation(never);
+    if (announceCache) {
+      // The SDK announces the flags it read from localStorage with a 'change' event, a moment after start().
+      fake.client.start.mockImplementation(() => {
+        setTimeout(() => fake.client.fire('change', anonymous, Object.keys(cached)), 5);
+        return never();
+      });
+    }
+    return fake;
+  }
+
+  it('initialize() and getState() resolve with the cached flags without waiting for the network', async () => {
+    const { sdk } = offlineSdk({ on: true, theme: 'green' });
+    const plugin = new LaunchDarklyWeb(async () => sdk);
+    const began = Date.now();
+    const state = await plugin.initialize({ clientSideId: 'cs-1', context: anonymous });
+    expect(Date.now() - began).toBeLessThan(CACHE_READ_MS);
+    expect(state).toEqual({
+      initialized: false,
+      source: 'cache',
+      flags: { on: true, theme: 'green' },
+      context: anonymous,
+    });
+    const again = Date.now();
+    await expect(plugin.getState()).resolves.toEqual(state);
+    expect(Date.now() - again).toBeLessThan(20);
+  });
+
+  it('waits for the cache read at most CACHE_READ_MS when nothing is announced', async () => {
+    const { sdk } = offlineSdk({}, false);
+    const plugin = new LaunchDarklyWeb(async () => sdk);
+    const began = Date.now();
+    const state = await plugin.initialize({ clientSideId: 'cs-1', context: anonymous });
+    expect(Date.now() - began).toBeLessThan(CACHE_READ_MS + 200);
+    expect(state).toEqual({ initialized: false, source: 'none', flags: {}, context: anonymous });
+  });
+
+  it('waitForInitialization() resolves timed out after its timeout instead of hanging or rejecting', async () => {
+    const { sdk } = offlineSdk({ on: true });
+    const plugin = new LaunchDarklyWeb(async () => sdk);
+    await plugin.initialize({ clientSideId: 'cs-1', context: anonymous });
+    await expect(plugin.waitForInitialization({ timeoutSeconds: 0.05 })).resolves.toEqual({
+      initialized: false,
+      timedOut: true,
+    });
+  });
+
+  it('identify() resolves timed out after its timeout, stores the context and switches to it', async () => {
+    const { sdk } = offlineSdk({ on: true });
+    const plugin = new LaunchDarklyWeb(async () => sdk);
+    await plugin.initialize({ clientSideId: 'cs-1', context: anonymous });
+    const began = Date.now();
+    await expect(plugin.identify({ context: ann, timeoutSeconds: 0.05 })).resolves.toEqual({ timedOut: true });
+    expect(Date.now() - began).toBeLessThan(1000);
+    expect(JSON.parse(storage.get(STORED_CONTEXT_KEY)!)).toEqual(ann);
+    await expect(plugin.getState()).resolves.toMatchObject({ context: ann, source: 'cache' });
   });
 });

@@ -107,9 +107,28 @@ test('both platforms default to the same shared anonymous context', () => {
 
 test('both platforms resolve getState() with the fields of LaunchDarklyState', () => {
   const fields = sorted(fieldsOf('LaunchDarklyState'));
-  const swift = read(`${SWIFT}/LaunchDarklyPlugin.swift`).match(/static func state[\s\S]*?\n {4}\}/)[0];
-  const kotlin = read(`${KOTLIN}/LaunchDarklyPlugin.kt`).match(/private fun state\(\)[\s\S]*?\n {4}\}/)[0];
+  const swift = read(`${SWIFT}/ClientState.swift`).match(/public var dictionary[\s\S]*?\n {4}\}/)[0];
+  const kotlin = read(`${KOTLIN}/LaunchDarklyPlugin.kt`).match(/fun toJs\(state: ClientState\)[\s\S]*?\n {8}\}/)[0];
   assert.deepEqual(sorted([...swift.matchAll(/"(\w+)"\]?\s*[:=]/g)].map((m) => m[1])), fields);
+  assert.deepEqual(sorted([...kotlin.matchAll(/put\("(\w+)"/g)].map((m) => m[1])), fields);
+});
+
+test('the three platforms answer the same flag sources', () => {
+  const declared = sorted([...definitions.match(/^ {2}source: ([^;]+);/m)[1].matchAll(/'(\w+)'/g)].map((m) => m[1]));
+  assert.deepEqual(declared, ['cache', 'network', 'none']);
+  const swift = sorted([...read(`${SWIFT}/ClientState.swift`).matchAll(/^ {4}case (\w+)$/gm)].map((m) => m[1]));
+  const kotlin = sorted([...read(`${KOTLIN}/ClientState.kt`).matchAll(/^ {4}[A-Z]+\("(\w+)"\)/gm)].map((m) => m[1]));
+  const web = sorted([...read('src/web.ts').matchAll(/'(network|cache|none)'/g)].map((m) => m[1]));
+  assert.deepEqual(swift, declared);
+  assert.deepEqual(kotlin, declared);
+  assert.deepEqual(web, declared);
+});
+
+test('both platforms resolve waitForInitialization() with the fields of WaitForInitializationResult', () => {
+  const fields = sorted(fieldsOf('WaitForInitializationResult'));
+  const swift = read(`${SWIFT}/LaunchDarklyPlugin.swift`).match(/func waitForInitialization[\s\S]*?\n {4}\}/)[0];
+  const kotlin = read(`${KOTLIN}/LaunchDarklyPlugin.kt`).match(/fun waitForInitialization[\s\S]*?\n {4}\}/)[0];
+  assert.deepEqual(sorted([...swift.matchAll(/"(\w+)":/g)].map((m) => m[1])), fields);
   assert.deepEqual(sorted([...kotlin.matchAll(/put\("(\w+)"/g)].map((m) => m[1])), fields);
 });
 
