@@ -56,6 +56,10 @@ The LaunchDarkly SDK versions are pinned in three places, which move together: `
 (`launchDarklyAndroidVersion`), `Package.swift` (`exact:`) and `CapacitorLaunchdarkly.podspec`. Update the version table at the
 top of the README in the same change.
 
+`.github/workflows/pins.yaml` does this every Monday when a newer release of either SDK is out: it opens a pull request that
+moves the pin, the podspec and the README table, and starts CI on its branch. It needs Settings > Actions > General > "Allow
+GitHub Actions to create and approve pull requests". `node scripts/check-pins.mjs` says where each pin stands.
+
 ## Publishing
 
 A release is a version bump in `package.json` merged to `main`: the `publish` job of `.github/workflows/ci.yaml` builds the

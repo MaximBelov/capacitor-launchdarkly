@@ -1,0 +1,31 @@
+name: SDK pins
+# The LaunchDarkly client SDKs are pinned exactly: on iOS in Package.swift (`exact:`) and the podspec, on Android as an `ext` default in
+# android/build.gradle, and Dependabot moves neither. So this looks every Monday, and on demand, at each SDK's latest release, and
+# opens a pull request that moves a pin when it is behind, a major release included: the pull request is what shows what a major
+# breaks. scripts/check-pins.mjs does the looking and the opening. Capacitor (capacitor-swift-pm, @capacitor/*) is not here.
+#
+# Two things have to hold for it to work:
+#   - Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests" is on. Without it GitHub refuses the pull
+#     request, and the run fails at `gh pr create` with the branch already pushed.
+#   - CI is started by the script itself, as a workflow_dispatch of ci.yaml on the branch, because the pull_request run of a pull request
+#     that a workflow opened is held until someone approves it.
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: write # the branch
+  pull-requests: write # the pull request
+  actions: write # CI on the branch
+jobs:
+  pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+      - run: node scripts/check-pins.mjs --pr
+        env:
+          GH_TOKEN: ${{ github.token }}
