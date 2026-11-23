@@ -12,7 +12,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", from: "8.0.0"),
         // The LaunchDarkly iOS client SDK, pinned to the version the plugin is tested with.
-        .package(url: "https://github.com/launchdarkly/ios-client-sdk.git", exact: "11.8.0")
+        .package(url: "https://github.com/launchdarkly/ios-client-sdk.git", exact: "11.8.1")
     ],
     targets: [
         .target(
