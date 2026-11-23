@@ -6,7 +6,7 @@ runs any of your code; on the web it runs LaunchDarkly's browser SDK.
 
 |                           | iOS                                    | Android                                      | Web                                             |
 | ------------------------- | -------------------------------------- | -------------------------------------------- | ----------------------------------------------- |
-| SDK                       | LaunchDarkly iOS client SDK 11.8.0     | LaunchDarkly Android client SDK 5.18.0       | `@launchdarkly/js-client-sdk` 4.x (you install) |
+| SDK                       | LaunchDarkly iOS client SDK 11.8.0     | LaunchDarkly Android client SDK 5.19.0       | `@launchdarkly/js-client-sdk` 4.x (you install) |
 | Key                       | mobile key (`mob-…`)                   | mobile key (`mob-…`)                         | client-side ID                                  |
 | Where the client starts   | natively at launch, or `initialize()`  | natively at launch, or `initialize()`        | `initialize()`                                  |
 | Stored context            | `UserDefaults`                         | `SharedPreferences`                          | `localStorage`                                  |
