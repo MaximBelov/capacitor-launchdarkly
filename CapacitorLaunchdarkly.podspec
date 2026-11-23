@@ -15,6 +15,6 @@ Pod::Spec.new do |s|
   s.ios.deployment_target = '15.0'
   s.dependency 'Capacitor'
   # The LaunchDarkly iOS client SDK, pinned to the version the plugin is tested with (the same as in Package.swift).
-  s.dependency 'LaunchDarkly', '11.8.0'
+  s.dependency 'LaunchDarkly', '11.8.1'
   s.swift_version = '5.1'
 end
